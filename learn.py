@@ -31,19 +31,100 @@ class inputLayer:
         return {'type': 'inputLayer',
                 'numInputs': self.numInputs}
 
+class concatenate:
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+    def numOutputs(self):
+        return self.a.numOutputs() + self.b.numOutputs()
+    def output(self):
+        return T.concatenate([self.a.output(), self.b.output()], axis=1)
+    def parameters(self):
+        # todo: uniq
+        return self.a.parameters() + self.b.parameters()
+    def all_layers_with_params(self):
+        # todo: uniq
+        return self.a.all_layers_with_params() + self.b.all_layers_with_params()
+    def dump(self):
+        return {'type': 'concatenate',
+                'a': self.a.dump(),
+                'b': self.b.dump()}
+        
+class negate:
+    def __init__(self, below):
+        self.below = below
+    def numOutputs(self):
+        return self.below.numOutputs()
+    def output(self):
+        return 1 - self.below.output()
+    def parameters(self):
+        return self.below.parameters()
+    def all_layers_with_params(self):
+        return self.below.all_layers_with_params()
+    def dump(self):
+        return {'type': 'negate',
+                'below': self.below.dump()}
+
+class appendNegated:
+    def __init__(self, below):
+        self.below = below
+    def numOutputs(self):
+        return 2*self.below.numOutputs()
+    def output(self):
+        o = self.below.output()
+        return T.concatenate([o, 1 - o], axis=1)
+    def parameters(self):
+        return self.below.parameters()
+    def all_layers_with_params(self):
+        return self.below.all_layers_with_params()
+    def dump(self):
+        return {'type': 'appendNegated',
+                'below': self.below.dump()}
+
+class andLayer:
+    def __init__(self, below, rng):
+        self.below = below
+        n = self.below.numOutputs()
+        print('alloc', n*n, 'weights for and layer')
+        self.initial_weights = np.asarray(
+            rng.uniform(low=0.9, high=1.1,
+                            size=(n*n)))
+        self.weights = theano.shared(self.initial_weights)
+    def numOutputs(self):
+        n = self.below.numOutputs()
+        return n*n
+    def output(self):
+        b = self.below.output()
+        prod = T.mul(b.dimshuffle(0,'x',1), b.dimshuffle(0,1,'x'))
+        n = b.shape[1]
+        outs = prod.reshape((b.shape[0], n*n)) * self.weights
+        return outs
+        #return T.exp(-T.maximum(0, outs))
+    def parameters(self):
+        return [self.weights]
+    def all_layers_with_params(self):
+        b = self.below.all_layers_with_params()
+        b.append(self)
+        return b
+    def dump(self):
+        return {'type': 'andLayer',
+                'below': self.below.dump(),
+                'weights': dumpVec(self.weights.get_value())}
+
+
 class layer:
     def __init__(self, below, numUnits, rng):
         self.below = below
         self.numUnits = numUnits
         self.rng = rng
         dataSize = below.numOutputs()
-        maxw = 0.2
+        maxw = 0.1
         self.initial_weights = np.minimum(
             maxw,
             np.maximum(
                 -maxw,
                 np.asarray(
-                    rng.normal(scale=maxw/3,
+                    rng.normal(scale=maxw/5,
                                size=(dataSize, numUnits)))))
         self.initial_bias = np.asarray(
                 rng.uniform(low=0.0, high=0.0000000001,
@@ -103,10 +184,39 @@ class relu:
     def output(self):
         input = self.below.output()
         return T.maximum(0, input)
+        #return T.minimum(1.0, T.maximum(0, input))
     def all_layers_with_params(self):
         return self.below.all_layers_with_params()
     def dump(self):
         return {'type': 'relu',
+                'below': self.below.dump()}
+
+class sigmoid:
+    def __init__(self, below):
+        self.below = below
+    def numOutputs(self):
+        return self.below.numOutputs()
+    def output(self):
+        input = self.below.output()
+        return T.nnet.sigmoid(input)
+    def all_layers_with_params(self):
+        return self.below.all_layers_with_params()
+    def dump(self):
+        return {'type': 'sigmoid',
+                'below': self.below.dump()}
+
+class nexp:
+    def __init__(self, below):
+        self.below = below
+    def numOutputs(self):
+        return self.below.numOutputs()
+    def output(self):
+        input = self.below.output()
+        return T.exp(-input)
+    def all_layers_with_params(self):
+        return self.below.all_layers_with_params()
+    def dump(self):
+        return {'type': 'nexp',
                 'below': self.below.dump()}
 
 class maxout:
@@ -170,6 +280,8 @@ def rebuild(d):
         return l
     elif t == 'relu':
         return relu(rebuild(d['below']))
+    elif t == 'sigmoid':
+        return sigmoid(rebuild(d['below']))
     elif t == 'maxout':
         n = 4
         if 'n' in d:
@@ -214,6 +326,8 @@ def getInputLayer(l):
     elif (t == layer
           or t == relu
           or t == maxout
+          or t == nexp
+          or t == sigmoid
           or t == softmax
           or t == negative_log_likelihood):
         return getInputLayer(l.below)
@@ -224,14 +338,21 @@ def getInputLayer(l):
 def allLayerActivationFunctions(l):
     t = type(l)
     if (t == relu
-        or t == maxout):
+        or t == maxout
+        or t == nexp
+        or t == sigmoid):
         return allLayerActivationFunctions(l.below) + [l]
     elif t == inputLayer:
         return []
     elif (t == layer
           or t == softmax
+          or t == negate
+          or t == appendNegated
+          or t == andLayer
           or t == negative_log_likelihood):
         return allLayerActivationFunctions(l.below)
+    elif (t == concatenate):
+        return allLayerActivationFunctions(l.a) + allLayerActivationFunctions(l.b)
     else:
         print('unrecog layer', l)
         assert False
@@ -243,8 +364,10 @@ def allUnitsLayers(l):
     elif t == inputLayer:
         return []
     elif (t == relu
+          or t == sigmoid
           or t == softmax
           or t == maxout
+          or t == nexp
           or t == negative_log_likelihood):
         return allUnitsLayers(l.below)
     else:
@@ -264,6 +387,27 @@ def dumpNetworkStructure(l):
     elif t == relu:
         dumpNetworkStructure(l.below)
         print('relu')
+    elif t == concatenate:
+        print('(')
+        dumpNetworkStructure(l.a)
+        print('|')
+        dumpNetworkStructure(l.b)
+        print(')concatenate')
+    elif t == negate:
+        dumpNetworkStructure(l.below)
+        print('negate')
+    elif t == appendNegated:
+        dumpNetworkStructure(l.below)
+        print('appendNegated')
+    elif t == andLayer:
+        dumpNetworkStructure(l.below)
+        print('andLayer')
+    elif t == sigmoid:
+        dumpNetworkStructure(l.below)
+        print('sigmoid')
+    elif t == nexp:
+        dumpNetworkStructure(l.below)
+        print('nexp')
     elif t == maxout:
         dumpNetworkStructure(l.below)
         print('maxout', l.n)
@@ -283,21 +427,28 @@ def setDropoutToAllUnits(net, p, scaleWeights):
         l.setScaleWeights(scaleWeights)
 
 
-def learn(filename):
+def learn(filename, saveWeights=True):
     data_nextchar.init()
     context_size = 7
     if filename == None:
         rng = np.random.RandomState(123)
         input = inputLayer(data_nextchar.input_width(context_size))
-        l1 = layer(input, 2000, rng)
-        l1o = maxout(l1, 4)
-        l2 = layer(l1o, 800, rng)
-        l2o = maxout(l2, 4)
-        l3 = layer(l2o, 800, rng)
-        l3o = maxout(l3, 4)
-        l4 = layer(l3o, 800, rng)
-        l4o = maxout(l4, 4)
-        llast = layer(l4o, data_nextchar.numChars(), rng)
+        l1 = layer(input, 600, rng)
+        #l1o = maxout(l1, 4)
+        #l1o = relu(l1)
+        l1o = sigmoid(l1)
+        l2 = layer(l1o, 500, rng)
+        #l2o = maxout(l2, 4)
+        #l2o = relu(l2)
+        l2o = sigmoid(l2)
+        l3 = layer(l2o, 400, rng)
+        # #l3o = maxout(l3, 4)
+        # l3o = relu(l3)
+        l3o = sigmoid(l3)
+        # l4 = layer(l3o, 200, rng)
+        # #l4o = maxout(l4, 4)
+        # l4o = relu(l4)
+        llast = layer(l3o, data_nextchar.numChars(), rng)
         output = softmax(llast)
         target_ = T.ivector('target')
         errorL = negative_log_likelihood(output, target_)
@@ -312,7 +463,7 @@ def learn(filename):
     nll = negative_log_likelihood(output, target).output()
 
     lr = T.scalar('lr')
-    setDropoutToAllUnits(errorL, 0.4, None)
+    setDropoutToAllUnits(llast.below, 0.5, None)
     dumpNetworkStructure(errorL)
     trainFunc = updateFunction(
         input.output(),
@@ -321,7 +472,7 @@ def learn(filename):
         errorL.all_layers_with_params(),
         lr)
 
-    setDropoutToAllUnits(errorL, None, 0.6)
+    setDropoutToAllUnits(llast.below, None, 0.5)
     testFunc = testFunction(
         input.output(),
         target,
@@ -329,9 +480,9 @@ def learn(filename):
         output,
         allLayerActivationFunctions(errorL))
 
-    minibatchSize = 200
+    minibatchSize = 100
 
-    testingMinibatchSize = 10000
+    testingMinibatchSize = 1000
     (testInputs, testOutputs, itxts, otxts) = data_nextchar.prepareMinibatch(
         testingMinibatchSize, context_size, False)
 
@@ -342,10 +493,10 @@ def learn(filename):
             minibatchSize, context_size, True)
         err = trainFunc(inputs.astype(np.float32),
                         outputs.astype(np.int32),
-                        0.003)
+                        0.01)
         trainingErrors.append(err)
         #print(t, '   training:', r3(err))
-        if t<20 or (t<100 and t%10 == 0) or t%50 == 0:
+        if t<10 or (t<100 and t%10 == 0) or t%50 == 0:
             trainingErr = np.mean(trainingErrors)
             trainingErrors = []
         
@@ -376,12 +527,133 @@ def learn(filename):
             #           [charidToChar(smo[m,p]) + " {:9.7f}".format(sm[m, smo[m,p]])
             #            for p in range(5)])
 
-        if t%1000 == 0:
+        if saveWeights and (t<1000 and t%100 == 0) or t%1000 == 0:
             filename = 'netm.json'
             with open(filename, 'w') as f:
                 f.write(json.dumps(errorL.dump()))
                 print('wrote', filename)
         t += 1
+
+
+def learn_logic(filename, saveWeights=False):
+    data_nextchar.init()
+    context_size = 3
+    if filename == None:
+        rng = np.random.RandomState(123)
+        input = inputLayer(data_nextchar.input_width(context_size))
+
+        nori1 = layer(input, 400, rng)
+        #nori1o = nexp(nori1)
+        #nori1o = relu(nori1)
+        nori1o = sigmoid(nori1)
+
+        # nori2 = layer(nori1o, 400, rng)
+        # #nori2o = nexp(nori2)
+        # # nori2o = relu(nori2)
+        # nori2o = sigmoid(nori2)
+
+        # nori3 = layer(nori2o, 400, rng)
+        # #nori3o = nexp(nori3)
+        # nori3o = sigmoid(nori3)
+
+        # fullInput = appendNegated(input)
+        # and1 = andLayer(fullInput, rng)
+        # red1 = layer(and1, 120, rng)
+        # red1o = sigmoid(red1)
+        # red1on = appendNegated(red1o)
+
+        # and2 = andLayer(red1on, rng)
+        # red2 = layer(and2, 80, rng)
+        # red2o = sigmoid(red2)
+
+        # andLast = andLayer(red1o, rng)
+        
+        llast = layer(nori1o, data_nextchar.numChars(), rng)
+        output = softmax(llast)
+        target_ = T.ivector('target')
+        errorL = negative_log_likelihood(output, target_)
+    else:
+        errorL = loadNet(filename)
+        input = getInputLayer(errorL)
+        output = errorL.below
+        llast = output.below
+
+    target = errorL.target
+    error = errorL.output()
+    nll = negative_log_likelihood(output, target).output()
+
+    lr = T.scalar('lr')
+    #setDropoutToAllUnits(llast.below, 0.5, None)
+    dumpNetworkStructure(errorL)
+    trainFunc = updateFunction(
+        input.output(),
+        target,
+        error,
+        errorL.all_layers_with_params(),
+        lr)
+
+    #setDropoutToAllUnits(llast.below, None, 0.5)
+    testFunc = testFunction(
+        input.output(),
+        target,
+        nll,
+        output,
+        allLayerActivationFunctions(errorL))
+
+    minibatchSize = 100
+
+    testingMinibatchSize = 10000
+    (testInputs, testOutputs, itxts, otxts) = data_nextchar.prepareMinibatch(
+        testingMinibatchSize, context_size, False)
+
+    trainingErrors = []
+    t = 0
+    while True:
+        (inputs, outputs, tritxts, trotxts) = data_nextchar.prepareMinibatch(
+            minibatchSize, context_size, True)
+        err = trainFunc(inputs.astype(np.float32),
+                        outputs.astype(np.int32),
+                        0.01)
+        trainingErrors.append(err)
+        #print(t, '   training:', r3(err))
+        if t<10 or (t<100 and t%10 == 0) or t%50 == 0:
+            trainingErr = np.mean(trainingErrors)
+            trainingErrors = []
+        
+            tres = testFunc(testInputs.astype(np.float32),
+                            testOutputs.astype(np.int32))
+            err = tres[0]
+            relus = tres[2:]
+            ### print('num >0  ', ', '.join([f3((r>0).sum()/r.size) for r in relus]))
+            ### print('num >0.3', ', '.join([f3((r>.3).sum()/r.size) for r in relus]))
+            ### print('num >1  ', ', '.join([f3((r>1).sum()/r.size) for r in relus]))
+            #lo = tres[2]
+            # print(lo[0,::])
+            # print(lo[1,::])
+            # print(lo[2,::])
+            sm = tres[1]
+            smo = np.argsort(sm, axis=1)[:, ::-1]
+            #print(smo[1:3])
+            hits = list([0 for _ in range(0, smo.shape[1])])
+            for v in range(0, smo.shape[0]):
+                for o in range(0, smo.shape[1]):
+                    if smo[v,o] == testOutputs[v]:
+                        hits[o] += 1
+                        continue
+            print(t, 'testing:', r3(err), 'training:', r3(trainingErr), hits)
+            sys.stdout.flush()
+            # for m in range(50):
+            #     print(titxt[m], totxt[m],
+            #           [charidToChar(smo[m,p]) + " {:9.7f}".format(sm[m, smo[m,p]])
+            #            for p in range(5)])
+
+        # if saveWeights and (t<1000 and t%100 == 0) or t%1000 == 0:
+        #     filename = 'netm.json'
+        #     with open(filename, 'w') as f:
+        #         f.write(json.dumps(errorL.dump()))
+        #         print('wrote', filename)
+        t += 1
+
 
 def reportLargeWeights(filename):
     errorL = loadNet(filename)
@@ -397,11 +669,12 @@ def reportLargeWeights(filename):
     max = np.max(wt)
     min = np.min(wt)
     print('max', max, 'min', min)
-    f = 0.5
-    extreme = (wt > f*max) + (wt < f*min)
+    fmax = 0.4
+    fmin = 0.4
+    extreme = (wt > fmax*max) + (wt < fmin*min)
     nc = data_nextchar.numChars()
     for u in range(0, wt.shape[0]):
-        print('unit', u, 'bias', bias[u])
+        print('\nunit', u, 'bias', bias[u])
         for i in np.argwhere(extreme[u,::]):
             c = i[0]
             nchar = c//nc
@@ -410,4 +683,7 @@ def reportLargeWeights(filename):
 
 
 #learn(None)
-reportLargeWeights('netm.json')
+#learn('netm.json', saveWeights=False)
+#reportLargeWeights('netm.json')
+
+learn_logic(None, True)
